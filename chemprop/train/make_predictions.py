@@ -3,6 +3,7 @@ import csv
 from typing import List, Optional, Union, Tuple
 
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
 
 from .predict import predict
@@ -112,7 +113,7 @@ def set_features(args: PredictArgs, train_args: TrainArgs):
 
 def predict_and_save(args: PredictArgs, train_args: TrainArgs, test_data: MoleculeDataset,
                      task_names: List[str], num_tasks: int, test_data_loader: MoleculeDataLoader, full_data: MoleculeDataset,
-                     full_to_valid_indices: dict, models: List[MoleculeModel], scalers: List[List[StandardScaler]],
+                     full_to_valid_indices: dict, models: List[MoleculeModel], scalers: List[Union[List[StandardScaler], StandardScaler]],
                      return_invalid_smiles: bool = False):
     """
     Function to predict with a model and save the predictions to file.
@@ -129,23 +130,37 @@ def predict_and_save(args: PredictArgs, train_args: TrainArgs, test_data: Molecu
     :param models: A list or generator object of :class:`~chemprop.models.MoleculeModel`\ s.
     :param scalers: A list or generator object of :class:`~chemprop.features.scaler.StandardScaler` objects.
     :param return_invalid_smiles: Whether to return predictions of "Invalid SMILES" for invalid SMILES, otherwise will skip them in returned predictions.
-    :return:  A list of lists of target predictions.
+    :return: A list of lists of target predictions.
     """
     # Predict with each model individually and sum predictions
     if args.dataset_type == 'multiclass':
         sum_preds = np.zeros((len(test_data), num_tasks, args.multiclass_num_classes))
+    elif train_args.is_atom_bond_targets:
+        n_atoms, n_bonds = test_data.number_of_atoms, test_data.number_of_bonds
+
+        sum_preds = []
+        for atom_target in train_args.atom_targets:
+            sum_preds.append(np.zeros((sum(n_atoms), 1)))
+        for bond_target in train_args.bond_targets:
+            sum_preds.append(np.zeros((sum(n_bonds), 1)))
     else:
         sum_preds = np.zeros((len(test_data), num_tasks))
     if args.ensemble_variance or args.individual_ensemble_predictions:
         if args.dataset_type == 'multiclass':
             all_preds = np.zeros((len(test_data), num_tasks, args.multiclass_num_classes, len(args.checkpoint_paths)))
+        elif train_args.is_atom_bond_targets:
+            all_preds = []
+            for atom_target in train_args.atom_targets:
+                all_preds.append(np.zeros((sum(n_atoms), 1, len(args.checkpoint_paths))))
+            for bond_target in train_args.bond_targets:
+                all_preds.append(np.zeros((sum(n_bonds), 1, len(args.checkpoint_paths))))
         else:
             all_preds = np.zeros((len(test_data), num_tasks, len(args.checkpoint_paths)))
 
     # Partial results for variance robust calculation.
     print(f'Predicting with an ensemble of {len(args.checkpoint_paths)} models')
     for index, (model, scaler_list) in enumerate(tqdm(zip(models, scalers), total=len(args.checkpoint_paths))):
-        scaler, features_scaler, atom_descriptor_scaler, bond_feature_scaler = scaler_list
+        scaler, features_scaler, atom_descriptor_scaler, bond_feature_scaler, atom_bond_scalers = scaler_list
 
         # Normalize features
         if args.features_scaling or train_args.atom_descriptor_scaling or train_args.bond_feature_scaling:
@@ -161,7 +176,8 @@ def predict_and_save(args: PredictArgs, train_args: TrainArgs, test_data: Molecu
         model_preds = predict(
             model=model,
             data_loader=test_data_loader,
-            scaler=scaler
+            scaler=scaler,
+            atom_bond_scalers=atom_bond_scalers
         )
         if args.dataset_type == 'spectra':
             model_preds = normalize_spectra(
@@ -174,15 +190,46 @@ def predict_and_save(args: PredictArgs, train_args: TrainArgs, test_data: Molecu
         if args.ensemble_variance or args.individual_ensemble_predictions:
             if args.dataset_type == 'multiclass':
                 all_preds[:,:,:,index] = model_preds
+            elif train_args.is_atom_bond_targets:
+                for i, pred in enumerate(model_preds):
+                    all_preds[i][:,:,index] = pred
             else:
                 all_preds[:,:,index] = model_preds
 
     # Ensemble predictions
     avg_preds = sum_preds / len(args.checkpoint_paths)
 
+    if train_args.is_atom_bond_targets:
+        tmp = []
+        for i, atom_target in enumerate(train_args.atom_targets):
+            tmp.append(np.split(avg_preds[i].flatten(), np.cumsum(np.array(n_atoms)))[:-1])
+        for i, bond_target in enumerate(train_args.bond_targets):
+            tmp.append(np.split(avg_preds[i+len(train_args.atom_targets)].flatten(), np.cumsum(np.array(n_bonds)))[:-1])
+        avg_preds = [[tmp[j][i] for j in range(num_tasks)] for i in range(len(test_data))]
+        if args.individual_ensemble_predictions:
+            reshaped_all_preds = [[[] for j in range(num_tasks)] for i in range(len(test_data))]
+            for i, atom_target in enumerate(train_args.atom_targets):
+                for j in range(len(args.checkpoint_paths)):
+                    atom_targets = np.split(all_preds[i][:,:,j].flatten(), np.cumsum(np.array(n_atoms)))[:-1]
+                    for k, target in enumerate(atom_targets):
+                        reshaped_all_preds[k][i].append(target)
+            for i, bond_target in enumerate(train_args.bond_targets):
+                for j in range(len(args.checkpoint_paths)):
+                    bond_targets = np.split(all_preds[i+len(train_args.atom_targets)][:,:,j].flatten(), np.cumsum(np.array(n_bonds)))[:-1]
+                    for k, target in enumerate(bond_targets):
+                        reshaped_all_preds[k][i+len(train_args.atom_targets)].append(target)
+
     if args.ensemble_variance:
         if args.dataset_type == 'spectra':
             all_epi_uncs = roundrobin_sid(all_preds)
+        elif train_args.is_atom_bond_targets:
+            all_epi_uncs = [np.var(all_pred, axis=2) for all_pred in all_preds]
+            tmp = []
+            for i, atom_target in enumerate(train_args.atom_targets):
+                tmp.append(np.split(all_epi_uncs[i].flatten(), np.cumsum(np.array(n_atoms)))[:-1])
+            for i, bond_target in enumerate(train_args.bond_targets):
+                tmp.append(np.split(all_epi_uncs[i+len(train_args.atom_targets)].flatten(), np.cumsum(np.array(n_bonds)))[:-1])
+            all_epi_uncs = [[tmp[j][i] for j in range(num_tasks)] for i in range(len(test_data))]
         else:
             all_epi_uncs = np.var(all_preds, axis=2)
             all_epi_uncs = all_epi_uncs.tolist()
@@ -210,7 +257,10 @@ def predict_and_save(args: PredictArgs, train_args: TrainArgs, test_data: Molecu
             else:
                 epi_uncs = all_epi_uncs[valid_index] if valid_index is not None else ['Invalid SMILES'] * num_tasks
         if args.individual_ensemble_predictions:
-            ind_preds = all_preds[valid_index] if valid_index is not None else [['Invalid SMILES'] * len(args.checkpoint_paths)] * num_tasks
+            if train_args.is_atom_bond_targets:
+                ind_preds = reshaped_all_preds[valid_index] if valid_index is not None else [['Invalid SMILES'] * len(args.checkpoint_paths)] * num_tasks
+            else:
+                ind_preds = all_preds[valid_index] if valid_index is not None else [['Invalid SMILES'] * len(args.checkpoint_paths)] * num_tasks
 
         # Reshape multiclass to merge task and class dimension, with updated num_tasks
         if args.dataset_type == 'multiclass':
@@ -232,7 +282,7 @@ def predict_and_save(args: PredictArgs, train_args: TrainArgs, test_data: Molecu
         for pred_name, pred in zip(task_names, preds):
             datapoint.row[pred_name] = pred
         if args.individual_ensemble_predictions:
-            for pred_name, model_preds in zip(task_names,ind_preds):
+            for pred_name, model_preds in zip(task_names, ind_preds):
                 for idx, pred in enumerate(model_preds):
                     datapoint.row[pred_name+f'_model_{idx}'] = pred
         if args.ensemble_variance:
@@ -243,15 +293,23 @@ def predict_and_save(args: PredictArgs, train_args: TrainArgs, test_data: Molecu
                     datapoint.row[pred_name+'_epi_unc'] = epi_unc
 
     # Save
-    with open(args.preds_path, 'w') as f:
-        writer = csv.DictWriter(f, fieldnames=full_data[0].row.keys())
-        writer.writeheader()
+    if train_args.is_atom_bond_targets:
+        data = {}
+        for key in full_data[0].row.keys():
+            data[key] = [datapoint.row[key] for datapoint in full_data]
+        preds_dataframe = pd.DataFrame.from_dict(data)
+        preds_dataframe.to_pickle(args.preds_path)
+    else:
+        with open(args.preds_path, 'w') as f:
+            writer = csv.DictWriter(f, fieldnames=full_data[0].row.keys())
+            writer.writeheader()
 
-        for datapoint in full_data:
-            writer.writerow(datapoint.row)
+            for datapoint in full_data:
+                writer.writerow(datapoint.row)
 
     # Return predicted values
-    avg_preds = avg_preds.tolist()
+    if not train_args.is_atom_bond_targets:
+        avg_preds = avg_preds.tolist()
     
     if return_invalid_smiles:
         full_preds = []
@@ -266,7 +324,7 @@ def predict_and_save(args: PredictArgs, train_args: TrainArgs, test_data: Molecu
 
 @timeit()
 def make_predictions(args: PredictArgs, smiles: List[List[str]] = None,
-                     model_objects: Tuple[PredictArgs, TrainArgs, List[MoleculeModel], List[StandardScaler], int, List[str]] = None,
+                     model_objects: Tuple[PredictArgs, TrainArgs, List[MoleculeModel], List[Union[List[StandardScaler], StandardScaler]], int, List[str]] = None,
                      return_invalid_smiles: bool = True,
                      return_index_dict: bool = False) -> List[List[Optional[float]]]:
     """

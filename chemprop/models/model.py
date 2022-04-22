@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from .mpn import MPN
+from .ffn import DenseLayers, MultiReadout
 from chemprop.args import TrainArgs
 from chemprop.features import BatchMolGraph
 from chemprop.nn_utils import get_activation_function, initialize_weights
@@ -27,7 +28,16 @@ class MoleculeModel(nn.Module):
         if self.classification or self.multiclass:
             self.no_training_normalization = args.loss_function in ['cross_entropy', 'binary_cross_entropy']
 
-        self.output_size = args.num_tasks
+        self.is_atom_bond_targets = args.is_atom_bond_targets
+
+        if self.is_atom_bond_targets:
+            self.atom_targets, self.bond_targets = args.atom_targets, args.bond_targets
+            self.atom_constraints, self.bond_constraints = args.atom_constraints, args.bond_constraints
+            self.device = args.device
+            self.output_size = 1
+        else:
+            self.output_size = args.num_tasks
+
         if self.multiclass:
             self.output_size *= args.multiclass_num_classes
 
@@ -84,47 +94,30 @@ class MoleculeModel(nn.Module):
         activation = get_activation_function(args.activation)
 
         # Create FFN layers
-        if args.ffn_num_layers == 1:
-            ffn = [
-                dropout,
-                nn.Linear(first_linear_dim, self.output_size)
-            ]
+        if self.is_atom_bond_targets:
+            self.readout = MultiReadout(features_size=first_linear_dim,
+                                        hidden_size=args.ffn_hidden_size,
+                                        num_layers=args.ffn_num_layers,
+                                        output_size=self.output_size,
+                                        dropout=dropout,
+                                        activation=activation,
+                                        atom_targets=args.atom_targets,
+                                        bond_targets=args.bond_targets,
+                                        atom_constraints=args.atom_constraints,
+                                        bond_constraints=args.bond_constraints)
         else:
-            ffn = [
-                dropout,
-                nn.Linear(first_linear_dim, args.ffn_hidden_size)
-            ]
-            for _ in range(args.ffn_num_layers - 2):
-                ffn.extend([
-                    activation,
-                    dropout,
-                    nn.Linear(args.ffn_hidden_size, args.ffn_hidden_size),
-                ])
-            ffn.extend([
-                activation,
-                dropout,
-                nn.Linear(args.ffn_hidden_size, self.output_size),
-            ])
+            self.readout = DenseLayers(first_linear_dim=first_linear_dim,
+                                       hidden_size=args.ffn_hidden_size,
+                                       num_layers=args.ffn_num_layers,
+                                       output_size=self.output_size,
+                                       dropout=dropout,
+                                       activation=activation,
+                                       dataset_type=args.dataset_type,
+                                       spectra_activation=args.spectra_activation)
 
-        # If spectra model, also include spectra activation
-        if args.dataset_type == 'spectra':
-            if args.spectra_activation == 'softplus':
-                spectra_activation = nn.Softplus()
-            else: # default exponential activation which must be made into a custom nn module
-                class nn_exp(torch.nn.Module):
-                    def __init__(self):
-                        super(nn_exp, self).__init__()
-                    def forward(self, x):
-                        return torch.exp(x)
-                spectra_activation = nn_exp()
-            ffn.append(spectra_activation)
-
-        # Create FFN model
-        self.ffn = nn.Sequential(*ffn)
-        
         if args.checkpoint_frzn is not None:
-            if args.frzn_ffn_layers >0:
-                for param in list(self.ffn.parameters())[0:2*args.frzn_ffn_layers]: # Freeze weights and bias for given number of layers
+            if args.frzn_ffn_layers > 0:
+                for param in list(self.readout.dense_layers.parameters())[0:2*args.frzn_ffn_layers]: # Freeze weights and bias for given number of layers
                     param.requires_grad=False
 
     def fingerprint(self,
@@ -149,10 +142,10 @@ class MoleculeModel(nn.Module):
         """
         if fingerprint_type == 'MPN':
             return self.encoder(batch, features_batch, atom_descriptors_batch,
-                                      atom_features_batch, bond_features_batch)
+                                atom_features_batch, bond_features_batch)
         elif fingerprint_type == 'last_FFN':
-            return self.ffn[:-1](self.encoder(batch, features_batch, atom_descriptors_batch,
-                                            atom_features_batch, bond_features_batch))
+            return self.readout.dense_layers[:-1](self.encoder(batch, features_batch, atom_descriptors_batch,
+                                                  atom_features_batch, bond_features_batch))
         else:
             raise ValueError(f'Unsupported fingerprint type {fingerprint_type}.')
 
@@ -161,7 +154,8 @@ class MoleculeModel(nn.Module):
                 features_batch: List[np.ndarray] = None,
                 atom_descriptors_batch: List[np.ndarray] = None,
                 atom_features_batch: List[np.ndarray] = None,
-                bond_features_batch: List[np.ndarray] = None) -> torch.FloatTensor:
+                bond_features_batch: List[np.ndarray] = None,
+                constraints_batch: List[torch.tensor] = None) -> torch.FloatTensor:
         """
         Runs the :class:`MoleculeModel` on input.
 
@@ -173,15 +167,24 @@ class MoleculeModel(nn.Module):
         :param atom_descriptors_batch: A list of numpy arrays containing additional atom descriptors.
         :param atom_features_batch: A list of numpy arrays containing additional atom features.
         :param bond_features_batch: A list of numpy arrays containing additional bond features.
+        :param constraints_batch: A list of torch.tensor which applies constraint on atomic/bond properties.
         :return: The output of the :class:`MoleculeModel`, containing a list of property predictions
         """
-
-        output = self.ffn(self.encoder(batch, features_batch, atom_descriptors_batch,
-                                       atom_features_batch, bond_features_batch))
+        if self.is_atom_bond_targets:
+            encodings = self.encoder(batch, features_batch, atom_descriptors_batch,
+                                     atom_features_batch, bond_features_batch)
+            output = self.readout(encodings, constraints_batch)
+        else:
+            encodings = self.encoder(batch, features_batch, atom_descriptors_batch,
+                                     atom_features_batch, bond_features_batch)
+            output = self.readout(encodings)
 
         # Don't apply sigmoid during training when using BCEWithLogitsLoss
         if self.classification and not (self.training and self.no_training_normalization):
-            output = self.sigmoid(output)
+            if self.is_atom_bond_targets:
+                output = [self.sigmoid(x) for x in output]
+            else:
+                output = self.sigmoid(output)
         if self.multiclass:
             output = output.reshape((output.size(0), -1, self.num_classes))  # batch size x num targets x num classes per target
             if not (self.training and self.no_training_normalization):
