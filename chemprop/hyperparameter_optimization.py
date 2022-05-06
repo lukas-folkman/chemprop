@@ -18,13 +18,22 @@ from chemprop.utils import create_logger, makedirs, timeit
 from chemprop.hyperopt_utils import merge_trials, load_trials, save_trials, get_hyperopt_seed, load_manual_trials
 
 
-SPACE = {
-    'hidden_size': hp.quniform('hidden_size', low=300, high=2400, q=100),
-    'depth': hp.quniform('depth', low=2, high=6, q=1),
-    'dropout': hp.quniform('dropout', low=0.0, high=0.4, q=0.05),
-    'ffn_num_layers': hp.quniform('ffn_num_layers', low=1, high=3, q=1)
-}
-INT_KEYS = ['hidden_size', 'depth', 'ffn_num_layers']
+# SPACE = {
+#     'hidden_size': hp.quniform('hidden_size', low=300, high=2400, q=100),
+#     'depth': hp.quniform('depth', low=2, high=6, q=1),
+#     'dropout': hp.quniform('dropout', low=0.0, high=0.4, q=0.05),
+#     'ffn_num_layers': hp.quniform('ffn_num_layers', low=1, high=3, q=1)
+# }
+
+# adopted for molecular glues
+# SPACE = {
+    # 'hidden_size': hp.quniform('hidden_size', low=200, high=1000, q=200),
+    # 'depth': hp.quniform('depth', low=1, high=4, q=1),
+    # 'dropout': hp.quniform('dropout', low=0.0, high=0.3, q=0.05),
+    # 'ffn_num_layers': hp.quniform('ffn_num_layers', low=1, high=3, q=1)
+# }
+# INT_KEYS = ['hidden_size', 'depth', 'ffn_num_layers']
+# INT_KEYS = ['ffn_num_layers']
 
 
 @timeit(logger_name=HYPEROPT_LOGGER_NAME)
@@ -44,6 +53,22 @@ def hyperopt(args: HyperoptArgs) -> None:
     :param args: A :class:`~chemprop.args.HyperoptArgs` object containing arguments for hyperparameter
                  optimization in addition to all arguments needed for training.
     """
+
+    if 'pretrain' in args.hyperopt_checkpoint_dir:
+        SPACE = {
+            'dropout': hp.quniform('dropout', low=0.0, high=0.3, q=0.05),
+            'ffn_num_layers': hp.quniform('ffn_num_layers', low=1, high=3, q=1)
+        }
+        INT_KEYS = ['ffn_num_layers']
+    else:
+        SPACE = {
+            'hidden_size': hp.quniform('hidden_size', low=200, high=1000, q=200),
+            'depth': hp.quniform('depth', low=1, high=4, q=1),
+            'dropout': hp.quniform('dropout', low=0.0, high=0.3, q=0.05),
+            'ffn_num_layers': hp.quniform('ffn_num_layers', low=1, high=3, q=1)
+        }
+        INT_KEYS = ['hidden_size', 'depth', 'ffn_num_layers']
+
     # Create logger
     logger = create_logger(name=HYPEROPT_LOGGER_NAME, save_dir=args.log_dir, quiet=True)
 

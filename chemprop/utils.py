@@ -12,7 +12,7 @@ from typing import Any, Callable, List, Tuple, Union
 import collections
 
 from sklearn.metrics import auc, mean_absolute_error, mean_squared_error, precision_recall_curve, r2_score,\
-    roc_auc_score, accuracy_score, log_loss
+    roc_auc_score, accuracy_score, log_loss, average_precision_score
 import torch
 import torch.nn as nn
 from torch.optim import Adam, Optimizer
@@ -89,7 +89,9 @@ def save_checkpoint(path: str,
 
 def load_checkpoint(path: str,
                     device: torch.device = None,
-                    logger: logging.Logger = None) -> MoleculeModel:
+                    logger: logging.Logger = None,
+                    args: TrainArgs = None,
+                    ignore_ffn_params: bool = False) -> MoleculeModel:
     """
     Loads a model checkpoint.
 
@@ -105,8 +107,9 @@ def load_checkpoint(path: str,
 
     # Load model and args
     state = torch.load(path, map_location=lambda storage, loc: storage)
-    args = TrainArgs()
-    args.from_dict(vars(state['args']), skip_unsettable=True)
+    if args is None:
+        args = TrainArgs()
+        args.from_dict(vars(state['args']), skip_unsettable=True)
     loaded_state_dict = state['state_dict']
 
     if device is not None:
@@ -117,6 +120,7 @@ def load_checkpoint(path: str,
     model_state_dict = model.state_dict()
 
     # Skip missing parameters and parameters of mismatched size
+    info(f'ignore_ffn_params: {ignore_ffn_params}')
     pretrained_state_dict = {}
     for loaded_param_name in loaded_state_dict.keys():
         # Backward compatibility for parameter names
@@ -126,14 +130,22 @@ def load_checkpoint(path: str,
             param_name = loaded_param_name
 
         # Load pretrained parameter, skipping unmatched parameters
-        if param_name not in model_state_dict:
+        if ignore_ffn_params and param_name.startswith('ffn'):
+            # LF: I prefer not to transfer FFN parameters
+            info(f'Info: Pretrained parameter "{loaded_param_name}" will be ignored because '
+                 f'it belongs to the feed-forward network.')
+        elif param_name not in model_state_dict:
             info(f'Warning: Pretrained parameter "{loaded_param_name}" cannot be found in model parameters.')
+            # LF: I prefer to fail if the networks are not compatible (note FFN parameters are ignored)
+            raise ValueError('Incompatible pretrained network')
         elif model_state_dict[param_name].shape != loaded_state_dict[loaded_param_name].shape:
             info(f'Warning: Pretrained parameter "{loaded_param_name}" '
                  f'of shape {loaded_state_dict[loaded_param_name].shape} does not match corresponding '
                  f'model parameter of shape {model_state_dict[param_name].shape}.')
+            # LF: I prefer to fail if the networks are not compatible (note FFN parameters are ignored)
+            raise ValueError('Incompatible pretrained network')
         else:
-            debug(f'Loading pretrained parameter "{loaded_param_name}".')
+            debug(f'Loading pretrained parameter "{loaded_param_name}": {model_state_dict[param_name].shape}, {loaded_state_dict[loaded_param_name].shape}')
             pretrained_state_dict[param_name] = loaded_state_dict[loaded_param_name]
 
     # Load pretrained weights
@@ -442,7 +454,8 @@ def get_metric_func(metric: str) -> Callable[[Union[List[int], List[float]], Lis
         return roc_auc_score
 
     if metric == 'prc-auc':
-        return prc_auc
+        # return prc_auc
+        return average_precision_score
 
     if metric == 'rmse':
         return rmse

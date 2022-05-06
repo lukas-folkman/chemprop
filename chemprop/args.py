@@ -264,6 +264,8 @@ class TrainArgs(CommonArgs):
     Random seed to use when splitting data into train/val/test sets.
     When :code`num_folds > 1`, the first fold uses this seed and all subsequent folds add 1 to the seed.
     """
+    no_early_stopping: bool = False
+    """Set to true to run all epochs and save the model from the very last epoch."""
     pytorch_seed: int = 0
     """Seed for PyTorch randomness (e.g., random initial weights)."""
     metric: Metric = None

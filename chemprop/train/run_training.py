@@ -188,6 +188,11 @@ def run_training(args: TrainArgs,
         shuffle=True,
         seed=args.seed
     )
+    val_train_data_loader = MoleculeDataLoader(
+        dataset=train_data,
+        batch_size=args.batch_size,
+        num_workers=num_workers,
+    )
     val_data_loader = MoleculeDataLoader(
         dataset=val_data,
         batch_size=args.batch_size,
@@ -215,7 +220,7 @@ def run_training(args: TrainArgs,
         # Load/build model
         if args.checkpoint_paths is not None:
             debug(f'Loading model {model_idx} from {args.checkpoint_paths[model_idx]}')
-            model = load_checkpoint(args.checkpoint_paths[model_idx], logger=logger)
+            model = load_checkpoint(args.checkpoint_paths[model_idx], logger=logger, args=args, ignore_ffn_params=True)
         else:
             debug(f'Building model {model_idx}')
             model = MoleculeModel(args)
@@ -265,6 +270,29 @@ def run_training(args: TrainArgs,
             )
             if isinstance(scheduler, ExponentialLR):
                 scheduler.step()
+
+            train_scores = evaluate(
+                model=model,
+                data_loader=val_train_data_loader,
+                num_tasks=args.num_tasks,
+                metrics=args.metrics,
+                dataset_type=args.dataset_type,
+                scaler=scaler,
+                logger=logger
+            )
+
+            for metric, scores in train_scores.items():
+                # Average train score
+                avg_train_score = np.nanmean(scores)
+                debug(f'Train {metric} = {avg_train_score:.6f}')
+                writer.add_scalar(f'train_{metric}', avg_train_score, n_iter)
+
+                if args.show_individual_scores:
+                    # Individual train scores
+                    for task_name, train_score in zip(args.task_names, scores):
+                        debug(f'Train {task_name} {metric} = {train_score:.6f}')
+                        writer.add_scalar(f'train_{task_name}_{metric}', train_score, n_iter)
+
             val_scores = evaluate(
                 model=model,
                 data_loader=val_data_loader,
@@ -288,10 +316,14 @@ def run_training(args: TrainArgs,
                         writer.add_scalar(f'validation_{task_name}_{metric}', val_score, n_iter)
 
             # Save model checkpoint if improved validation score
+            save_model = args.no_early_stopping
             avg_val_score = np.nanmean(val_scores[args.metric])
             if args.minimize_score and avg_val_score < best_score or \
                     not args.minimize_score and avg_val_score > best_score:
                 best_score, best_epoch = avg_val_score, epoch
+                save_model = True
+            if save_model:
+                debug(f'Saving model at epoch {epoch}')
                 save_checkpoint(os.path.join(save_dir, MODEL_FILE_NAME), model, scaler, features_scaler,
                                 atom_descriptor_scaler, bond_feature_scaler, args)
 

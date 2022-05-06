@@ -10,6 +10,7 @@ FeaturesGenerator = Callable[[Molecule], np.ndarray]
 
 
 FEATURES_GENERATOR_REGISTRY = {}
+EQUIBIND_DF = {}
 
 
 def register_features_generator(features_generator_name: str) -> Callable[[FeaturesGenerator], FeaturesGenerator]:
@@ -43,6 +44,50 @@ def get_features_generator(features_generator_name: str) -> FeaturesGenerator:
 def get_available_features_generators() -> List[str]:
     """Returns a list of names of available features generators."""
     return list(FEATURES_GENERATOR_REGISTRY.keys())
+
+
+def _unique_smiles(mol_or_smile):
+    if isinstance(mol_or_smile, str):
+        sm = Chem.MolToSmiles(Chem.MolFromSmiles(mol_or_smile), isomericSmiles=True)
+    else:
+        sm = Chem.MolToSmiles(mol_or_smile, isomericSmiles=True)
+    return sm
+
+
+def _equibind_generator(mol: Molecule, which: str) -> np.ndarray:
+    if which not in EQUIBIND_DF:
+        assert which in ['equibind',
+                         'equibind_best_models_AF2_separate',
+                         'equibind_best_models']
+        import os
+        import pandas as pd
+        print("Reading EquiBind DB")
+        bind_df = pd.read_csv(os.path.join('..', 'resources', 'EquiBind', f'{which}.csv'))
+        bind_df = bind_df.loc[bind_df['experiment_type'] == 'regenerated_coords']
+        bind_df['smiles'] = [_unique_smiles(sm) for sm in bind_df['smiles']]
+        bind_df = bind_df.set_index(['smiles', 'protein'])['rf_score_v3']
+        bind_df = bind_df.loc[~bind_df.index.duplicated()]
+        assert bind_df.index.is_unique
+        bind_df = bind_df.unstack().sort_index(axis=1)
+        EQUIBIND_DF[which] = bind_df
+
+    sm = _unique_smiles(mol)
+    return EQUIBIND_DF[which].loc[sm].values
+
+
+@register_features_generator('equibind')
+def equibind_best_models_generator(mol: Molecule) -> np.ndarray:
+    return _equibind_generator(mol=mol, which='equibind')
+
+
+@register_features_generator('equibind_best_models_AF2_separate')
+def equibind_best_models_generator(mol: Molecule) -> np.ndarray:
+    return _equibind_generator(mol=mol, which='equibind_best_models_AF2_separate')
+
+
+@register_features_generator('equibind_best_models')
+def equibind_best_models_generator(mol: Molecule) -> np.ndarray:
+    return _equibind_generator(mol=mol, which='equibind_best_models')
 
 
 MORGAN_RADIUS = 2

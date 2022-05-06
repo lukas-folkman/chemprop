@@ -40,7 +40,9 @@ def load_features(path: str) -> np.ndarray:
     extension = os.path.splitext(path)[1]
 
     if extension == '.npz':
-        features = np.load(path)['features']
+        _d = np.load(path)
+        assert 'features' in _d.files or 'rdkit_2d_normalized' in _d.files
+        features = _d['features' if 'features' in _d.files else 'rdkit_2d_normalized']
     elif extension == '.npy':
         features = np.load(path)
     elif extension in ['.csv', '.txt']:
